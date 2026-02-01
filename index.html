@@ -104,15 +104,14 @@
             }
         }
     </style>
-<base target="_blank">
 </head>
 <body class="text-gray-800 antialiased overflow-x-hidden">
 
     <!-- Header -->
     <header class="fixed top-0 left-0 right-0 z-50 glass-card border-b border-white/50">
         <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
-            <div class="flex items-center gap-3">
-                <img src="logo.png" alt="Seismic" class="h-8 w-auto opacity-90" onerror="this.style.display='none'">
+            <div class="flex items-center gap-2">
+                <img src="logo.png" alt="Seismic" class="h-8 w-auto opacity-90 mr-1" onerror="this.style.display='none'">
                 <span class="font-semibold text-warm-brown tracking-tight">Seismic</span>
             </div>
             <nav class="hidden md:flex items-center gap-8 text-sm font-medium text-gray-600">
@@ -617,73 +616,340 @@ contract Token {
             });
         });
 
-        // Linter Logic
+        // Two-Pass Static Analyzer
         function lintCode(code) {
             const issues = [];
             const lines = code.split('\n');
-
-            lines.forEach((line, index) => {
-                const lineNum = index + 1;
-                const trimmed = line.trim();
-
-                // Check 1: public stype
-                const publicStypeMatch = line.match(/\b(suint\d*|sint\d*|sbool|saddress)\s+public\b/);
-                if (publicStypeMatch) {
-                    issues.push({
-                        line: lineNum,
-                        type: 'error',
-                        message: `stype variable cannot be public: "${publicStypeMatch[1]}"`,
-                        rule: 'Public stype',
-                        fix: `Make it private or internal`
-                    });
+            
+            // Helper: Get line content without comments
+            function stripComments(line) {
+                return line.replace(/\/\/.*/, '').replace(/\/\*.*\*\//, '');
+            }
+            
+            // Helper: Check if line is inside a function (for context)
+            function isInsideFunction(startLine) {
+                let braceCount = 0;
+                let inFunction = false;
+                for (let i = 0; i <= startLine; i++) {
+                    const line = lines[i] || '';
+                    if (/\bfunction\b/.test(line) && !/\bfunction\b.*=>/.test(line)) {
+                        inFunction = true;
+                    }
+                    if (inFunction) {
+                        braceCount += (line.match(/\{/g) || []).length;
+                        braceCount -= (line.match(/\}/g) || []).length;
+                        if (braceCount <= 0 && i < startLine) {
+                            inFunction = false;
+                        }
+                    }
                 }
-
-                // Check 2: constant stype
-                const constantStypeMatch = line.match(/\b(suint\d*|sint\d*|sbool|saddress)\s+(?:constant|immutable)\b/);
-                if (constantStypeMatch) {
-                    issues.push({
-                        line: lineNum,
-                        type: 'error',
-                        message: `stype cannot be constant or immutable: "${constantStypeMatch[1]}"`,
-                        rule: 'Constant stype',
-                        fix: `Use a storage variable instead`
+                return inFunction;
+            }
+            
+            // ============================================
+            // PASS 1: Identify all stype variable declarations
+            // ============================================
+            const stypeVariables = []; // { name, line, type, isPublic, isConstant, context }
+            
+            const stypeTypePattern = /\b(suint|sint|sbool|saddress)(\d*)\b/;
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const cleanLine = stripComments(line);
+                
+                // Skip if no stype keyword
+                if (!stypeTypePattern.test(cleanLine)) continue;
+                
+                // Extract stype type
+                const typeMatch = cleanLine.match(stypeTypePattern);
+                const stypeType = typeMatch[1] + (typeMatch[2] || '');
+                
+                // Pattern 1: State variable declaration
+                // Format: [stypeType] [visibility]? [constant]? [name] [= ...];
+                // Examples: suint256 public balance; suint256 constant MAX = 100;
+                const stateVarPattern = new RegExp(
+                    `\\b(suint|sint|sbool|saddress)(\\d*)\\s+` + // stype type
+                    `(?:(public|private|internal)\\s+)?` + // optional visibility
+                    `(?:(constant|immutable)\\s+)?` + // optional constant/immutable
+                    `([a-zA-Z_][a-zA-Z0-9_]*)` + // variable name
+                    `(?:\\s*=|;|\\s)` // terminator
+                );
+                
+                const stateMatch = cleanLine.match(stateVarPattern);
+                if (stateMatch) {
+                    const visibility = stateMatch[3] || '';
+                    const isConstant = stateMatch[4] === 'constant' || stateMatch[4] === 'immutable';
+                    const varName = stateMatch[5];
+                    
+                    stypeVariables.push({
+                        name: varName,
+                        line: i + 1,
+                        stype: stypeType,
+                        isPublic: visibility === 'public',
+                        isConstant: isConstant,
+                        isMapping: false,
+                        context: 'state'
                     });
+                    continue;
                 }
-
-                // Check 3: returning stype from public/external
-                if (line.match(/\b(public|external)\b/) && line.includes('returns') && line.match(/\b(suint|sint|sbool|saddress)\d*\b/)) {
-                    issues.push({
-                        line: lineNum,
-                        type: 'error',
-                        message: `Cannot return stype from public/external function`,
-                        rule: 'Return stype',
-                        fix: `Cast to unshielded type before returning`
+                
+                // Pattern 2: Mapping declaration
+                // Format: mapping(...) [visibility]? [name];
+                // Examples: mapping(address => suint256) public balanceOf;
+                const mappingPattern = /mapping\s*\([^)]*=>\s*(suint|sint|sbool|saddress)(\d*)\s*\)\s+(?:(public|private|internal)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/;
+                const mappingMatch = cleanLine.match(mappingPattern);
+                if (mappingMatch) {
+                    const mapStype = mappingMatch[1] + (mappingMatch[2] || '');
+                    const visibility = mappingMatch[3] || '';
+                    const varName = mappingMatch[4];
+                    
+                    stypeVariables.push({
+                        name: varName,
+                        line: i + 1,
+                        stype: mapStype,
+                        isPublic: visibility === 'public',
+                        isConstant: false,
+                        isMapping: true,
+                        context: 'state'
                     });
+                    continue;
                 }
-
-                // Check 4: casting stype to uint/int (warning)
-                const castMatch = line.match(/\b(uint\d*|int\d*)\s*\(\s*(\w+)\s*\)/);
-                if (castMatch) {
-                    const varName = castMatch[2];
-                    // Check if this variable was declared as stype earlier
-                    const prevLines = lines.slice(0, index).join('\n');
-                    if (prevLines.includes(`suint`) || prevLines.includes(`sint`) || prevLines.includes(`sbool`) || prevLines.includes(`saddress`)) {
-                        // Simple heuristic: if we see any stype declaration before, warn on explicit casts
-                        if (line.includes('suint') || line.includes('sint') || prevLines.match(new RegExp(`\\b(suint|sint|sbool|saddress)\\d*\\s+${varName}\\b`))) {
-                            issues.push({
-                                line: lineNum,
-                                type: 'warning',
-                                message: `Casting stype to ${castMatch[1]} leaks the hidden value`,
-                                rule: 'Casting leak',
-                                fix: `Ensure intentional disclosure`
+                
+                // Pattern 3: Function parameter
+                // Format: function name(..., stypeType varName, ...)
+                // We need to check if we're inside function parameters
+                if (/\bfunction\b/.test(cleanLine)) {
+                    // Extract parameter list
+                    const paramsMatch = cleanLine.match(/function\s+\w+\s*\(([^)]*)\)/);
+                    if (paramsMatch) {
+                        const params = paramsMatch[1];
+                        // Find all stype parameters
+                        const paramPattern = /\b(suint|sint|sbool|saddress)(\d*)\s+(?:calldata\s+|memory\s+|storage\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/g;
+                        let paramMatch;
+                        while ((paramMatch = paramPattern.exec(params)) !== null) {
+                            stypeVariables.push({
+                                name: paramMatch[3],
+                                line: i + 1,
+                                stype: paramMatch[1] + (paramMatch[2] || ''),
+                                isPublic: false,
+                                isConstant: false,
+                                isMapping: false,
+                                context: 'parameter'
                             });
                         }
                     }
                 }
+                
+                // Pattern 4: Local variable declaration (inside function)
+                // Format: stypeType varName;
+                if (isInsideFunction(i)) {
+                    const localVarPattern = new RegExp(
+                        `\\b(suint|sint|sbool|saddress)(\\d*)\\s+` +
+                        `([a-zA-Z_][a-zA-Z0-9_]*)` +
+                        `(?:\\s*=|;|\\s)`
+                    );
+                    const localMatch = cleanLine.match(localVarPattern);
+                    if (localMatch) {
+                        stypeVariables.push({
+                            name: localMatch[3],
+                            line: i + 1,
+                            stype: localMatch[1] + (localMatch[2] || ''),
+                            isPublic: false,
+                            isConstant: false,
+                            isMapping: false,
+                            context: 'local'
+                        });
+                    }
+                }
+            }
+            
+            // ============================================
+            // PASS 2: Analyze rules using variable knowledge
+            // ============================================
+            
+            // Rule A: Public stype variables (state variables only, not parameters)
+            stypeVariables.forEach(variable => {
+                if (variable.context === 'state' && variable.isPublic) {
+                    issues.push({
+                        line: variable.line,
+                        type: 'error',
+                        message: `Public state variable with stype: "${variable.name}" (${variable.stype})`,
+                        rule: 'Public stype',
+                        fix: `Change visibility to private or internal`
+                    });
+                }
             });
-
-            displayResults(issues);
-            highlightLines(issues);
+            
+            // Rule D: Constant stype
+            stypeVariables.forEach(variable => {
+                if (variable.isConstant) {
+                    issues.push({
+                        line: variable.line,
+                        type: 'error',
+                        message: `stype cannot be constant or immutable: "${variable.name}" (${variable.stype})`,
+                        rule: 'Constant stype',
+                        fix: `Use a storage variable without constant/immutable`
+                    });
+                }
+            });
+            
+            // Rule B: Return stype from public/external functions
+            // Multi-line returns detection
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const cleanLine = stripComments(line);
+                
+                // Check if this is a function declaration
+                if (!/\bfunction\b/.test(cleanLine)) continue;
+                
+                // Check if function is public/external (before the opening brace)
+                const beforeBrace = cleanLine.split('{')[0];
+                const isPublicExternal = /\b(public|external)\b/.test(beforeBrace);
+                
+                if (!isPublicExternal) continue;
+                
+                // Check if this line contains 'returns'
+                if (!cleanLine.includes('returns')) continue;
+                
+                // Start collecting the returns block
+                let returnsContent = '';
+                let returnsStartLine = i;
+                let foundReturns = false;
+                let parenDepth = 0;
+                let j = i;
+                
+                // Process lines starting from the 'returns' line
+                while (j < lines.length) {
+                    const currentLine = stripComments(lines[j]);
+                    
+                    // Find 'returns' keyword if not yet found
+                    if (!foundReturns) {
+                        const returnsIndex = currentLine.indexOf('returns');
+                        if (returnsIndex !== -1) {
+                            foundReturns = true;
+                            returnsStartLine = j;
+                            // Start from after 'returns'
+                            const afterReturns = currentLine.substring(returnsIndex + 'returns'.length);
+                            
+                            // Look for opening paren
+                            const openParenIndex = afterReturns.indexOf('(');
+                            if (openParenIndex !== -1) {
+                                parenDepth = 1;
+                                returnsContent = afterReturns.substring(openParenIndex + 1);
+                                
+                                // Check if closing paren is on same line
+                                for (let k = 0; k < returnsContent.length; k++) {
+                                    if (returnsContent[k] === '(') parenDepth++;
+                                    if (returnsContent[k] === ')') {
+                                        parenDepth--;
+                                        if (parenDepth === 0) {
+                                            // Found complete returns on same line
+                                            const contentBeforeClose = returnsContent.substring(0, k);
+                                            if (stypeTypePattern.test(contentBeforeClose)) {
+                                                const stypeMatch = contentBeforeClose.match(stypeTypePattern);
+                                                issues.push({
+                                                    line: returnsStartLine + 1,
+                                                    type: 'error',
+                                                    message: `Cannot return stype "${stypeMatch[0]}" from public/external function`,
+                                                    rule: 'Return stype',
+                                                    fix: `Cast to unshielded type before returning`
+                                                });
+                                            }
+                                            j = lines.length; // Exit outer while
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (parenDepth === 0) break; // Already processed
+                            } else {
+                                // No opening paren on same line, continue to next line
+                                j++;
+                                continue;
+                            }
+                        } else {
+                            // 'returns' not on this line (shouldn't happen given our check)
+                            break;
+                        }
+                    } else {
+                        // Already found 'returns', now collecting content
+                        for (let k = 0; k < currentLine.length; k++) {
+                            const char = currentLine[k];
+                            
+                            if (char === '(') parenDepth++;
+                            if (char === ')') {
+                                parenDepth--;
+                                if (parenDepth === 0) {
+                                    // Found closing paren, check all collected content
+                                    const fullContent = returnsContent + currentLine.substring(0, k);
+                                    if (stypeTypePattern.test(fullContent)) {
+                                        const stypeMatch = fullContent.match(stypeTypePattern);
+                                        issues.push({
+                                            line: returnsStartLine + 1,
+                                            type: 'error',
+                                            message: `Cannot return stype "${stypeMatch[0]}" from public/external function`,
+                                            rule: 'Return stype',
+                                            fix: `Cast to unshielded type before returning`
+                                        });
+                                    }
+                                    j = lines.length; // Exit outer while
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Add current line content if we haven't closed yet
+                        if (parenDepth > 0) {
+                            returnsContent += currentLine;
+                        }
+                    }
+                    
+                    j++;
+                }
+            }
+            
+            // Rule C: Casting leaks
+            // Check if any stype variable name appears inside uint/int casts
+            const castPattern = /\b(uint|int)(\d*)\s*\(([^)]*)\)/g;
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const cleanLine = stripComments(line);
+                
+                let castMatch;
+                while ((castMatch = castPattern.exec(cleanLine)) !== null) {
+                    const targetType = castMatch[1] + (castMatch[2] || '');
+                    const castContent = castMatch[3].trim();
+                    
+                    // Check if any stype variable is being cast
+                    stypeVariables.forEach(variable => {
+                        // Check for exact variable name or variable with array access/methods
+                        const varPattern = new RegExp(`\\b${variable.name}\\b`);
+                        if (varPattern.test(castContent)) {
+                            issues.push({
+                                line: i + 1,
+                                type: 'warning',
+                                message: `Casting stype "${variable.name}" (${variable.stype}) to ${targetType} leaks the hidden value`,
+                                rule: 'Casting leak',
+                                fix: `Ensure intentional disclosure is needed`
+                            });
+                        }
+                    });
+                }
+            }
+            
+            // Remove duplicate issues (same line, same rule)
+            const uniqueIssues = [];
+            const seen = new Set();
+            issues.forEach(issue => {
+                const key = `${issue.line}-${issue.rule}`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    uniqueIssues.push(issue);
+                }
+            });
+            
+            displayResults(uniqueIssues);
+            highlightLines(uniqueIssues);
         }
 
         function displayResults(issues) {
